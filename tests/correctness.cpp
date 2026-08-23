@@ -55,6 +55,17 @@ int main() {
         passed = passed && case_passed;
       }
     }
+
+    bool rejected_invalid_shape = false;
+    try {
+      cuda_conv::Conv2DShape invalid{1, 3, 5, 5, 8, 7, 1};
+      invalid.validate();
+    } catch (const std::invalid_argument&) {
+      rejected_invalid_shape = true;
+    }
+    std::cout << "invalid shape validation "
+              << (rejected_invalid_shape ? "PASS" : "FAIL") << '\n';
+    passed = passed && rejected_invalid_shape;
     return passed ? 0 : 2;
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << '\n';

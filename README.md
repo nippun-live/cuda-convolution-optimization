@@ -4,6 +4,8 @@ A shape-general FP32 implementation of valid 2D convolution in NCHW layout,
 built to make GPU optimization decisions measurable rather than anecdotal.
 The project compares a scalar CPU oracle with direct CUDA convolution, an
 implicit-im2col tiled GEMM kernel, and a transparent layer-adaptive dispatcher.
+On the reference RTX 3050 run, tiled GEMM reached 360.8 GFLOP/s and up to
+1.68x the direct CUDA kernel while remaining within 1.31e-6 of the CPU oracle.
 
 The repository grew from CUDA convolution experiments by **Nippun Sabharwal**
 and was rebuilt as a standalone, reproducible systems project. It contains no
@@ -73,11 +75,30 @@ Run from a Visual Studio Developer PowerShell:
 ./build/cuda-conv-bench --quick
 ./build/cuda-conv-bench --iterations 100 --csv results/local.csv
 ./build/cuda-conv-bench --algorithm tiled-gemm
+./build/cuda-conv-bench --shape 8,3,32,32,16,3,1 --algorithm all
 ~~~
+
+The shape order is N,C,H,W,M,K,S, and --shape can be repeated to construct a
+custom sweep. Console output reports speedup over the direct CUDA kernel;
+the CSV additionally retains the optimized scalar-CPU comparison.
 
 The benchmark reports kernel-only latency separately from end-to-end latency.
 Every timed configuration is checked against the CPU reference before it is
 marked as passing.
+
+## Why not cuDNN?
+
+For production convolution, use cuDNN. It has architecture-specific kernels,
+heuristic engine selection, autotuning, broader datatype support, and years of
+optimization that this study does not attempt to replace.
+
+The purpose here is to expose the mechanisms hidden behind a library call:
+tensor indexing, memory reuse, tiling, implicit lowering, synchronization,
+shape-dependent dispatch, numerical validation, and disciplined timing. A
+custom kernel becomes operationally justified when it enables fusion,
+specialized layouts or sparsity, unusual small-shape behavior, or another
+workload constraint that a general library cannot express efficiently. No
+such superiority claim is made for this generic convolution.
 
 ## Reference results
 
@@ -87,13 +108,13 @@ single-threaded scalar oracle compiled with MSVC /O2. Each row below uses the
 explicit kernel named in the table rather than selecting the best result after
 the fact.
 
-| Shape | Kernel | Kernel time | Throughput | CPU speedup | Max abs. error |
+| Shape | Kernel | Kernel time | Throughput | Direct speedup | Max abs. error |
 |---|---:|---:|---:|---:|---:|
-| N1 C1 8x8, M4 K3 S1 | direct | 0.0115 ms | 0.2 GFLOP/s | 0.2x | 1.49e-8 |
-| N8 C3 32x32, M16 K3 S1 | tiled-gemm | 0.0342 ms | 181.8 GFLOP/s | 132.2x | 8.94e-8 |
-| N4 C16 32x32, M32 K3 S1 | tiled-gemm | 0.1366 ms | 242.8 GFLOP/s | 197.6x | 2.98e-7 |
-| N4 C32 31x29, M64 K3 S2 | tiled-gemm | 0.1349 ms | 229.6 GFLOP/s | 160.7x | 3.58e-7 |
-| N2 C64 28x28, M64 K5 S1 | tiled-gemm | 0.6824 ms | 345.7 GFLOP/s | 308.0x | 1.31e-6 |
+| N1 C1 8x8, M4 K3 S1 | direct | 0.0106 ms | 0.2 GFLOP/s | 1.00x | 1.49e-8 |
+| N8 C3 32x32, M16 K3 S1 | tiled-gemm | 0.0339 ms | 183.3 GFLOP/s | 1.17x | 8.94e-8 |
+| N4 C16 32x32, M32 K3 S1 | tiled-gemm | 0.1356 ms | 244.6 GFLOP/s | 1.14x | 2.98e-7 |
+| N4 C32 31x29, M64 K3 S2 | tiled-gemm | 0.1297 ms | 238.7 GFLOP/s | 1.68x | 3.58e-7 |
+| N2 C64 28x28, M64 K5 S1 | tiled-gemm | 0.6540 ms | 360.8 GFLOP/s | 1.63x | 1.31e-6 |
 
 The tiny workload is intentionally retained: kernel-launch overhead makes both
 GPU paths slower than the CPU oracle, and their difference is within ordinary

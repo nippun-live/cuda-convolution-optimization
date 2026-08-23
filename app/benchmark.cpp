@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,9 +22,28 @@ struct Options {
   int iterations = 50;
   bool quick = false;
   std::string csv_path;
+  std::vector<Conv2DShape> custom_shapes;
   std::vector<Algorithm> algorithms{
       Algorithm::Direct, Algorithm::TiledGemm, Algorithm::Adaptive};
 };
+
+Conv2DShape parse_shape(const std::string& value) {
+  std::stringstream stream(value);
+  std::string token;
+  std::vector<int> dimensions;
+  while (std::getline(stream, token, ',')) {
+    dimensions.push_back(std::stoi(token));
+  }
+  if (dimensions.size() != 7) {
+    throw std::invalid_argument(
+        "shape must contain N,C,H,W,M,K,S as seven comma-separated integers");
+  }
+  Conv2DShape shape{dimensions[0], dimensions[1], dimensions[2],
+                    dimensions[3], dimensions[4], dimensions[5],
+                    dimensions[6]};
+  shape.validate();
+  return shape;
+}
 
 Options parse_options(const int argc, char** argv) {
   Options options;
@@ -47,11 +67,14 @@ Options parse_options(const int argc, char** argv) {
       }
     } else if (argument == "--csv" && i + 1 < argc) {
       options.csv_path = argv[++i];
+    } else if (argument == "--shape" && i + 1 < argc) {
+      options.custom_shapes.push_back(parse_shape(argv[++i]));
     } else if (argument == "--help") {
       std::cout
           << "Usage: cuda-conv-bench [--quick] [--warmup N] "
              "[--iterations N]\n"
              "                       [--algorithm direct|tiled-gemm|adaptive|all]\n"
+             "                       [--shape N,C,H,W,M,K,S] (repeatable)\n"
              "                       [--csv results.csv]\n";
       std::exit(0);
     } else {
@@ -90,15 +113,18 @@ int main(int argc, char** argv) {
                      (1024.0 * 1024.0 * 1024.0)
               << " GiB)\n\n";
 
-    std::vector<Conv2DShape> shapes{
-        {1, 1, 8, 8, 4, 3, 1},
-        {8, 3, 32, 32, 16, 3, 1},
-        {4, 16, 32, 32, 32, 3, 1},
-        {4, 32, 31, 29, 64, 3, 2},
-        {2, 64, 28, 28, 64, 5, 1},
-    };
-    if (options.quick) {
-      shapes.resize(3);
+    std::vector<Conv2DShape> shapes = options.custom_shapes;
+    if (shapes.empty()) {
+      shapes = {
+          {1, 1, 8, 8, 4, 3, 1},
+          {8, 3, 32, 32, 16, 3, 1},
+          {4, 16, 32, 32, 32, 3, 1},
+          {4, 32, 31, 29, 64, 3, 2},
+          {2, 64, 28, 28, 64, 5, 1},
+      };
+      if (options.quick) {
+        shapes.resize(3);
+      }
     }
 
     std::ofstream csv;
@@ -109,13 +135,14 @@ int main(int argc, char** argv) {
                                  options.csv_path);
       }
       csv << "device,shape,requested,executed,kernel_ms,end_to_end_ms,"
-             "cpu_ms,kernel_speedup,gflops,max_abs,max_rel,mean_abs,pass\n";
+             "cpu_ms,cpu_speedup,direct_speedup,gflops,max_abs,max_rel,"
+             "mean_abs,pass\n";
     }
 
     std::cout << std::left << std::setw(30) << "Shape" << std::setw(13)
               << "Requested" << std::setw(13) << "Executed" << std::right
               << std::setw(11) << "Kernel ms" << std::setw(11) << "GFLOP/s"
-              << std::setw(12) << "CPU x" << std::setw(12) << "Max abs"
+              << std::setw(12) << "Direct x" << std::setw(12) << "Max abs"
               << std::setw(8) << "Check" << '\n';
     std::cout << std::string(110, '-') << '\n';
 
@@ -138,17 +165,24 @@ int main(int argc, char** argv) {
               .count() /
           static_cast<float>(kCpuIterations);
 
+      const auto direct_baseline =
+          cuda_conv::run_cuda(input, weights, shape, Algorithm::Direct,
+                              options.warmup, options.iterations);
       for (const Algorithm requested : options.algorithms) {
-        const auto result =
-            cuda_conv::run_cuda(input, weights, shape, requested,
-                                options.warmup, options.iterations);
+        const auto result = requested == Algorithm::Direct
+                                ? direct_baseline
+                                : cuda_conv::run_cuda(
+                                      input, weights, shape, requested,
+                                      options.warmup, options.iterations);
         const auto error =
             cuda_conv::compare_outputs(reference, result.output);
         const bool passed = error.max_abs <= 1.0e-3f;
         all_passed = all_passed && passed;
         const double gflops =
             operation_count(shape) / (result.kernel_ms * 1.0e6);
-        const double speedup = cpu_ms / result.kernel_ms;
+        const double cpu_speedup = cpu_ms / result.kernel_ms;
+        const double direct_speedup =
+            direct_baseline.kernel_ms / result.kernel_ms;
 
         std::cout << std::left << std::setw(30) << shape.to_string()
                   << std::setw(13) << cuda_conv::algorithm_name(requested)
@@ -156,7 +190,7 @@ int main(int argc, char** argv) {
                   << cuda_conv::algorithm_name(result.executed) << std::right
                   << std::fixed << std::setprecision(4) << std::setw(11)
                   << result.kernel_ms << std::setprecision(1) << std::setw(11)
-                  << gflops << std::setw(12) << speedup << std::scientific
+                  << gflops << std::setw(12) << direct_speedup << std::scientific
                   << std::setprecision(2) << std::setw(12) << error.max_abs
                   << std::setw(8) << (passed ? "PASS" : "FAIL") << '\n';
 
@@ -165,8 +199,9 @@ int main(int argc, char** argv) {
               << cuda_conv::algorithm_name(requested) << ','
               << cuda_conv::algorithm_name(result.executed) << ','
               << std::fixed << std::setprecision(6) << result.kernel_ms << ','
-              << result.end_to_end_ms << ',' << cpu_ms << ',' << speedup << ','
-              << gflops << ',' << std::scientific << error.max_abs << ','
+              << result.end_to_end_ms << ',' << cpu_ms << ',' << cpu_speedup
+              << ',' << direct_speedup << ',' << gflops << ','
+              << std::scientific << error.max_abs << ','
               << error.max_rel << ',' << error.mean_abs << ','
               << (passed ? "true" : "false") << '\n';
         }
