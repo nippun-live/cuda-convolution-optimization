@@ -1,0 +1,14 @@
+/build*/
+/.vs/
+/.vscode/
+*.obj
+*.o
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.nsys-rep
+*.ncu-rep
+results/*.csv
+!results/reference-rtx3050.csv
