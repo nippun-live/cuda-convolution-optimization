@@ -1,5 +1,6 @@
 #include "cuda_conv/conv2d.hpp"
 
+#include <cmath>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -30,6 +31,8 @@ int main() {
     const std::vector<cuda_conv::Algorithm> algorithms{
         cuda_conv::Algorithm::Direct,
         cuda_conv::Algorithm::TiledGemm,
+        cuda_conv::Algorithm::TensorCoreFp16,
+        cuda_conv::Algorithm::TensorCoreBf16,
         cuda_conv::Algorithm::Adaptive,
     };
 
@@ -46,7 +49,11 @@ int main() {
             cuda_conv::run_cuda(input, weights, shape, algorithm, 1, 2);
         const auto error =
             cuda_conv::compare_outputs(reference, result.output);
-        const bool case_passed = error.max_abs <= 1.0e-3f;
+        const bool mixed_precision =
+            result.executed == cuda_conv::Algorithm::TensorCoreFp16 ||
+            result.executed == cuda_conv::Algorithm::TensorCoreBf16;
+        const float tolerance = mixed_precision ? 2.0e-2f : 1.0e-3f;
+        const bool case_passed = error.max_abs <= tolerance;
         std::cout << shape.to_string() << " "
                   << cuda_conv::algorithm_name(algorithm) << " -> "
                   << cuda_conv::algorithm_name(result.executed)
@@ -55,6 +62,25 @@ int main() {
         passed = passed && case_passed;
       }
     }
+
+    const cuda_conv::Conv2DShape wide_range_shape{1, 16, 4, 4, 1, 1, 1};
+    const std::vector<float> wide_input(wide_range_shape.input_elements(),
+                                        1.0e4f);
+    const std::vector<float> wide_weights(wide_range_shape.weight_elements(),
+                                          1.0e-4f);
+    std::vector<float> wide_reference;
+    cuda_conv::conv2d_cpu(wide_input, wide_weights, wide_reference,
+                          wide_range_shape);
+    const auto wide_bf16 = cuda_conv::run_cuda(
+        wide_input, wide_weights, wide_range_shape,
+        cuda_conv::Algorithm::TensorCoreBf16, 1, 2);
+    const auto wide_error =
+        cuda_conv::compare_outputs(wide_reference, wide_bf16.output);
+    const bool wide_range_passed = std::isfinite(wide_bf16.output.front()) &&
+                                   wide_error.max_rel <= 2.0e-2f;
+    std::cout << "BF16 wide-range regression max_rel=" << wide_error.max_rel
+              << " " << (wide_range_passed ? "PASS" : "FAIL") << '\n';
+    passed = passed && wide_range_passed;
 
     bool rejected_invalid_shape = false;
     try {

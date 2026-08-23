@@ -27,6 +27,8 @@ struct Conv2DShape {
 enum class Algorithm {
   Direct,
   TiledGemm,
+  TensorCoreFp16,
+  TensorCoreBf16,
   Adaptive,
 };
 

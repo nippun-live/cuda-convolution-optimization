@@ -1,5 +1,6 @@
 #include "cuda_conv/conv2d.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -20,11 +21,13 @@ using cuda_conv::Conv2DShape;
 struct Options {
   int warmup = 5;
   int iterations = 50;
+  int trials = 3;
   bool quick = false;
   std::string csv_path;
   std::vector<Conv2DShape> custom_shapes;
   std::vector<Algorithm> algorithms{
-      Algorithm::Direct, Algorithm::TiledGemm, Algorithm::Adaptive};
+      Algorithm::Direct, Algorithm::TiledGemm, Algorithm::TensorCoreFp16,
+      Algorithm::TensorCoreBf16, Algorithm::Adaptive};
 };
 
 Conv2DShape parse_shape(const std::string& value) {
@@ -53,14 +56,19 @@ Options parse_options(const int argc, char** argv) {
       options.quick = true;
       options.warmup = 2;
       options.iterations = 10;
+      options.trials = 1;
     } else if (argument == "--iterations" && i + 1 < argc) {
       options.iterations = std::stoi(argv[++i]);
     } else if (argument == "--warmup" && i + 1 < argc) {
       options.warmup = std::stoi(argv[++i]);
+    } else if (argument == "--trials" && i + 1 < argc) {
+      options.trials = std::stoi(argv[++i]);
     } else if (argument == "--algorithm" && i + 1 < argc) {
       const std::string value = argv[++i];
       if (value == "all") {
         options.algorithms = {Algorithm::Direct, Algorithm::TiledGemm,
+                              Algorithm::TensorCoreFp16,
+                              Algorithm::TensorCoreBf16,
                               Algorithm::Adaptive};
       } else {
         options.algorithms = {cuda_conv::parse_algorithm(value)};
@@ -72,8 +80,8 @@ Options parse_options(const int argc, char** argv) {
     } else if (argument == "--help") {
       std::cout
           << "Usage: cuda-conv-bench [--quick] [--warmup N] "
-             "[--iterations N]\n"
-             "                       [--algorithm direct|tiled-gemm|adaptive|all]\n"
+             "[--iterations N] [--trials N]\n"
+             "                       [--algorithm direct|tiled-gemm|tensor-fp16|tensor-bf16|adaptive|all]\n"
              "                       [--shape N,C,H,W,M,K,S] (repeatable)\n"
              "                       [--csv results.csv]\n";
       std::exit(0);
@@ -81,6 +89,9 @@ Options parse_options(const int argc, char** argv) {
       throw std::invalid_argument("unknown or incomplete argument: " +
                                   argument);
     }
+  }
+  if (options.trials <= 0) {
+    throw std::invalid_argument("trials must be positive");
   }
   return options;
 }
@@ -98,6 +109,26 @@ std::vector<float> random_vector(const std::size_t size,
 double operation_count(const Conv2DShape& shape) {
   return 2.0 * static_cast<double>(shape.output_elements()) *
          shape.in_channels * shape.kernel * shape.kernel;
+}
+
+cuda_conv::RunResult run_median_trial(const std::vector<float>& input,
+                                      const std::vector<float>& weights,
+                                      const Conv2DShape& shape,
+                                      const Algorithm algorithm,
+                                      const Options& options) {
+  std::vector<cuda_conv::RunResult> results;
+  results.reserve(options.trials);
+  for (int trial = 0; trial < options.trials; ++trial) {
+    results.push_back(cuda_conv::run_cuda(input, weights, shape, algorithm,
+                                          options.warmup,
+                                          options.iterations));
+  }
+  std::sort(results.begin(), results.end(),
+            [](const cuda_conv::RunResult& left,
+               const cuda_conv::RunResult& right) {
+              return left.kernel_ms < right.kernel_ms;
+            });
+  return results[results.size() / 2];
 }
 
 }  // namespace
@@ -165,18 +196,20 @@ int main(int argc, char** argv) {
               .count() /
           static_cast<float>(kCpuIterations);
 
-      const auto direct_baseline =
-          cuda_conv::run_cuda(input, weights, shape, Algorithm::Direct,
-                              options.warmup, options.iterations);
+      const auto direct_baseline = run_median_trial(
+          input, weights, shape, Algorithm::Direct, options);
       for (const Algorithm requested : options.algorithms) {
         const auto result = requested == Algorithm::Direct
                                 ? direct_baseline
-                                : cuda_conv::run_cuda(
-                                      input, weights, shape, requested,
-                                      options.warmup, options.iterations);
+                                : run_median_trial(input, weights, shape,
+                                                   requested, options);
         const auto error =
             cuda_conv::compare_outputs(reference, result.output);
-        const bool passed = error.max_abs <= 1.0e-3f;
+        const bool mixed_precision =
+            result.executed == Algorithm::TensorCoreFp16 ||
+            result.executed == Algorithm::TensorCoreBf16;
+        const float tolerance = mixed_precision ? 2.0e-2f : 1.0e-3f;
+        const bool passed = error.max_abs <= tolerance;
         all_passed = all_passed && passed;
         const double gflops =
             operation_count(shape) / (result.kernel_ms * 1.0e6);

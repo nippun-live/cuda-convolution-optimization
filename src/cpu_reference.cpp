@@ -70,6 +70,10 @@ const char* algorithm_name(const Algorithm algorithm) {
       return "direct";
     case Algorithm::TiledGemm:
       return "tiled-gemm";
+    case Algorithm::TensorCoreFp16:
+      return "tensor-fp16";
+    case Algorithm::TensorCoreBf16:
+      return "tensor-bf16";
     case Algorithm::Adaptive:
       return "adaptive";
   }
@@ -82,6 +86,12 @@ Algorithm parse_algorithm(const std::string& value) {
   }
   if (value == "tiled-gemm" || value == "gemm") {
     return Algorithm::TiledGemm;
+  }
+  if (value == "tensor-fp16" || value == "fp16") {
+    return Algorithm::TensorCoreFp16;
+  }
+  if (value == "tensor-bf16" || value == "bf16") {
+    return Algorithm::TensorCoreBf16;
   }
   if (value == "adaptive") {
     return Algorithm::Adaptive;
