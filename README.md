@@ -4,12 +4,10 @@ A shape-general FP32 implementation of valid 2D convolution in NCHW layout,
 built to make GPU optimization decisions measurable rather than anecdotal.
 The project compares a scalar CPU oracle with direct CUDA convolution, an
 implicit-im2col tiled GEMM kernel, and a transparent layer-adaptive dispatcher.
-On the reference RTX 3050 run, tiled GEMM reached 360.8 GFLOP/s and up to
-1.68x the direct CUDA kernel while remaining within 1.31e-6 of the CPU oracle.
-
-The repository grew from CUDA convolution experiments by **Nippun Sabharwal**
-and was rebuilt as a standalone, reproducible systems project. It contains no
-course harness, datasets, model checkpoints, or hidden evaluation code.
+On the reference RTX 3050 run, the optimized kernels reached 360.8 GFLOP/s,
+up to 1.68x the direct CUDA kernel, and up to 308x the optimized single-thread
+CPU oracle while remaining within 1.31e-6 of its output. Speedups use
+kernel-only GPU timing; end-to-end timings are reported separately.
 
 ## What this demonstrates
 
