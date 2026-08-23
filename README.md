@@ -31,6 +31,7 @@ src/cpu_reference.cpp        scalar correctness oracle and error metrics
 src/cuda_conv.cu             FP32/Tensor Core kernels, dispatch, and timing
 app/benchmark.cpp            reproducible benchmark CLI and CSV export
 tests/correctness.cpp        shape and stride regression suite
+scripts/plot_results.py      benchmark figure generated from the reference CSV
 docs/optimization-notes.md   retained designs, negative results, methodology
 results/                     committed reference measurements
 ~~~
@@ -106,6 +107,12 @@ such superiority claim is made for this generic convolution.
 
 ## Reference results
 
+![Grouped throughput bars for FP32, FP16, and BF16 kernels alongside an accuracy-throughput plot](docs/benchmark-summary.png)
+
+The left panel shows where Tensor Core execution helps across workloads; the
+right panel makes the precision tradeoff explicit on the largest tested layer.
+All plotted values come from the committed reference CSV.
+
 Measured on an NVIDIA GeForce RTX 3050 Laptop GPU (compute capability 8.6),
 CUDA 12.8, and driver 596.08. The CPU comparison is an optimized,
 single-threaded scalar oracle compiled with MSVC /O2. Values are medians of
@@ -128,6 +135,12 @@ run-to-run noise. This prevents the larger-layer speedups from being presented
 as universal. Raw measurements, including end-to-end latency and all five
 execution modes, are in
 [results/reference-rtx3050.csv](results/reference-rtx3050.csv).
+
+Regenerate the figure with Python, Matplotlib, and NumPy:
+
+~~~bash
+python scripts/plot_results.py
+~~~
 
 ## Scope
 
