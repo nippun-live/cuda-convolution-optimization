@@ -1,122 +1,60 @@
-# CUDA Convolution Optimization Lab
+# CUDA Convolution Kernels: FP32 to Tensor Cores
 
-A shape-general implementation of valid 2D convolution in NCHW layout, built
-to make GPU optimization decisions measurable rather than anecdotal. The
-project compares a scalar CPU oracle with direct and implicit-GEMM FP32 CUDA
-kernels, FP16 and BF16 Tensor Core paths with FP32 accumulation, and a
-transparent layer-adaptive dispatcher. On an RTX 3050 Laptop GPU, five-trial
-median results reached 428.4 GFLOP/s, up to 1.89x the direct CUDA kernel and
-over 350x the optimized single-thread CPU oracle. Speedups use kernel-only timing;
-conversion, allocation, and transfer costs are reported separately.
+A ground-up implementation of NCHW `Conv2D` that progresses from a direct
+FP32 kernel to shared-memory implicit GEMM and four-warp FP16/BF16 Tensor Core
+execution. The project focuses on the parts hidden by high-level libraries:
+indexing, data movement, tiling, precision, dispatch, numerical validation,
+and reproducible GPU timing.
 
-## What this demonstrates
-
-- Correct indexing for arbitrary batch sizes, rectangular inputs, non-tile-
-  aligned outputs, and configurable stride.
-- Constant-memory filter reuse when a direct-convolution filter bank fits in
-  CUDA's 64 KiB constant-memory budget.
-- A 16 x 16 shared-memory GEMM formulation that generates im2col coordinates
-  on demand instead of materializing the expanded matrix.
-- Four-warp Tensor Core kernels with genuine FP16 or BF16 tensor storage,
-  shared weight reuse, tail-safe tiles, and FP32 accumulation.
-- Layer-adaptive dispatch using an explicit, inspectable heuristic.
-- CPU-oracle validation, CUDA-event kernel timing, separate end-to-end timing,
-  deterministic inputs, and repeated-trial median reporting.
-
-## Repository layout
-
-~~~text
-include/cuda_conv/conv2d.hpp  public shape, algorithm, and result API
-src/cpu_reference.cpp        scalar correctness oracle and error metrics
-src/cuda_conv.cu             FP32/Tensor Core kernels, dispatch, and timing
-app/benchmark.cpp            reproducible benchmark CLI and CSV export
-tests/correctness.cpp        shape and stride regression suite
-scripts/plot_results.py      benchmark figure generated from the reference CSV
-docs/optimization-notes.md   retained designs, negative results, methodology
-results/                     committed reference measurements
-~~~
-
-## Requirements
-
-- NVIDIA GPU with CUDA support
-- CUDA Toolkit 12.x or a compatible recent toolkit
-- C++17 host compiler
-- CMake 3.24+ (recommended) or direct nvcc
-
-The FP16 Tensor Core path requires compute capability 7.0 or newer; BF16
-requires Ampere (8.0) or newer. FP32 kernels remain available on older GPUs.
-
-## Build
-
-### CMake
-
-~~~bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-~~~
-
-Override architecture detection when cross-compiling:
-
-~~~bash
-cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
-~~~
-
-### Windows without CMake
-
-Run from a Visual Studio Developer PowerShell:
-
-~~~powershell
-.\scripts\build_windows.ps1
-.\build\cuda-conv-correctness.exe
-~~~
-
-Use `-BuildDirectory build-local` to select a different output directory.
-
-## Benchmark
-
-~~~bash
-./build/cuda-conv-bench --quick
-./build/cuda-conv-bench --iterations 100 --trials 5 --csv results/local.csv
-./build/cuda-conv-bench --algorithm tensor-fp16
-./build/cuda-conv-bench --algorithm tensor-bf16
-./build/cuda-conv-bench --shape 8,3,32,32,16,3,1 --algorithm all
-~~~
-
-The shape order is N,C,H,W,M,K,S, and --shape can be repeated to construct a
-custom sweep. Console output reports speedup over the direct CUDA kernel;
-the CSV additionally retains the optimized scalar-CPU comparison.
-
-The benchmark reports the median kernel time across repeated trials separately
-from end-to-end latency. Every timed configuration is checked against the FP32
-CPU reference before it is marked as passing.
-
-## Why not cuDNN?
-
-For production convolution, use cuDNN. It has architecture-specific kernels,
-heuristic engine selection, autotuning, broader datatype support, and years of
-optimization that this study does not attempt to replace.
-
-The purpose here is to expose the mechanisms hidden behind a library call:
-tensor indexing, memory reuse, tiling, implicit lowering, synchronization,
-shape-dependent dispatch, numerical validation, and disciplined timing. A
-custom kernel becomes operationally justified when it enables fusion,
-specialized layouts or sparsity, unusual small-shape behavior, or another
-workload constraint that a general library cannot express efficiently. No
-such superiority claim is made for this generic convolution.
-
-## Reference results
+**Peak measured result:** 428.4 GFLOP/s on an RTX 3050 Laptop GPU, with up to
+1.89x the direct CUDA baseline and 1.67x the FP32 tiled kernel on matched
+workloads.
 
 ![Grouped throughput bars for FP32, FP16, and BF16 kernels alongside an accuracy-throughput plot](docs/benchmark-summary.png)
 
-The left panel shows where Tensor Core execution helps across workloads; the
-right panel makes the precision tradeoff explicit on the largest tested layer.
-All plotted values come from the committed reference CSV.
+The left panel compares kernel throughput across four convolution workloads.
+The right panel shows the accuracy-throughput tradeoff for the largest tested
+reduction. Values are five-trial medians from the committed reference CSV.
 
-Measured on an NVIDIA GeForce RTX 3050 Laptop GPU (compute capability 8.6),
-CUDA 12.8, and driver 596.08. The CPU comparison is an optimized,
-single-threaded scalar oracle compiled with MSVC /O2. Values are medians of
-five trials with 100 timed kernel launches per trial.
+## Kernel stack
+
+| Implementation | Execution model | Key optimization |
+|---|---|---|
+| `direct` | One CUDA thread per output | Register accumulation and constant-memory filters when the weight bank fits in 64 KiB |
+| `tiled-gemm` | 16 x 16 FP32 thread block | Shared-memory tiles and implicit im2col without an expanded global-memory matrix |
+| `tensor-fp16` | Four WMMA warps per block | FP16 input/weight storage, shared weight reuse, and FP32 accumulation |
+| `tensor-bf16` | Four WMMA warps per block | BF16 storage for wider exponent range with FP32 accumulation |
+| `adaptive` | Explicit FP32 heuristic | Direct execution for small outputs and tiled GEMM for larger layers |
+
+## Tensor Core dataflow
+
+The mixed-precision kernels do more than cast FP32 values inside a scalar
+kernel. Inputs and weights are stored as true 16-bit tensors before transfer.
+Each block then:
+
+1. Loads one 16 x 16 weight tile into shared memory.
+2. Reuses that tile across four warps processing different output-position
+   tiles.
+3. Generates implicit-im2col coordinates on demand for each warp.
+4. Executes 16 x 16 x 16 WMMA operations with FP32 accumulators.
+5. Zero-pads reduction and output tails so arbitrary channel counts and
+   non-aligned spatial dimensions remain valid.
+
+FP16 and BF16 are explicit algorithms rather than hidden inside adaptive
+dispatch. Choosing a faster representation should also mean consciously
+choosing its numerical behavior.
+
+## Performance
+
+Measurements use CUDA events for kernel time and a separate wall-clock path
+for allocation, conversion, transfers, execution, and output retrieval. Every
+row is the median of five trials with 100 timed launches per trial; deterministic
+inputs are regenerated from a fixed seed and checked against the FP32 CPU
+oracle before a result is accepted.
+
+Reference system: NVIDIA GeForce RTX 3050 Laptop GPU (compute capability 8.6),
+CUDA 12.8, and driver 596.08. The correctness oracle is single-threaded FP32
+code compiled with MSVC `/O2`.
 
 | Shape | Kernel | Kernel time | Throughput | Direct speedup | Max abs. error |
 |---|---:|---:|---:|---:|---:|
@@ -129,33 +67,108 @@ five trials with 100 timed kernel launches per trial.
 | N2 C64 28x28, M64 K5 S1 | tensor FP16 | 0.5593 ms | 421.9 GFLOP/s | 1.39x | 9.69e-4 |
 | N2 C64 28x28, M64 K5 S1 | tensor BF16 | 0.5507 ms | 428.4 GFLOP/s | 1.41x | 7.65e-3 |
 
-The tiny workload is intentionally retained: kernel-launch overhead makes the
-GPU kernels slower than the CPU oracle, and their differences are within ordinary
-run-to-run noise. This prevents the larger-layer speedups from being presented
-as universal. Raw measurements, including end-to-end latency and all five
-execution modes, are in
-[results/reference-rtx3050.csv](results/reference-rtx3050.csv).
+The peak BF16 measurement was also 355.8x the optimized single-thread CPU
+oracle. The tiny workload is retained to show the launch-overhead regime where
+GPU execution is not beneficial. Direct CUDA remains the primary optimization
+baseline; the CPU implementation is principally a correctness oracle. Full
+kernel and end-to-end measurements for all five execution modes are available
+in [the reference CSV](results/reference-rtx3050.csv).
 
-Regenerate the figure with Python, Matplotlib, and NumPy:
+## Correctness and numerical behavior
+
+The regression suite covers:
+
+- Arbitrary batch sizes and channel counts.
+- Rectangular inputs, configurable stride, and non-tile-aligned outputs.
+- FP32 direct and tiled kernels against a scalar CPU oracle.
+- FP16 and BF16 Tensor Core outputs with dtype-specific tolerances.
+- A wide-range BF16 case that exercises values poorly suited to FP16's exponent
+  range.
+- Invalid shape rejection before launching a kernel.
+
+Across the regression suite, maximum absolute error remained below 1.2e-3 for
+FP16 and 7.9e-3 for BF16. The FP32 implementations remained within 1.4e-6 of
+the oracle.
+
+## Build and run
+
+Requirements: an NVIDIA GPU, CUDA Toolkit 12.x or a compatible recent toolkit,
+a C++17 compiler, and CMake 3.24+ or direct `nvcc`. FP16 Tensor Core execution
+requires compute capability 7.0+; BF16 requires Ampere (8.0)+. The FP32 paths
+remain available on older CUDA GPUs.
+
+~~~bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+~~~
+
+When cross-compiling, set the architecture explicitly, for example
+`-DCMAKE_CUDA_ARCHITECTURES=86`.
+
+On Windows, a Visual Studio Developer PowerShell can build directly with
+`nvcc`:
+
+~~~powershell
+.\scripts\build_windows.ps1
+.\build\cuda-conv-correctness.exe
+~~~
+
+Use `-BuildDirectory build-local` to choose a different output directory.
+
+## Benchmark CLI
+
+~~~bash
+./build/cuda-conv-bench --quick
+./build/cuda-conv-bench --iterations 100 --trials 5 --csv results/local.csv
+./build/cuda-conv-bench --algorithm tensor-fp16
+./build/cuda-conv-bench --algorithm tensor-bf16
+./build/cuda-conv-bench --shape 8,3,32,32,16,3,1 --algorithm all
+~~~
+
+Custom shapes use `N,C,H,W,M,K,S`; repeat `--shape` to construct a sweep.
+Console output reports speedup over direct CUDA, while CSV output includes
+kernel time, end-to-end time, throughput, CPU and direct speedups, and error
+metrics.
+
+Regenerate the benchmark figure with Python, Matplotlib, and NumPy:
 
 ~~~bash
 python scripts/plot_results.py
 ~~~
 
+## Project structure
+
+~~~text
+include/cuda_conv/conv2d.hpp  public shape, algorithm, and result API
+src/cpu_reference.cpp        scalar oracle and numerical error metrics
+src/cuda_conv.cu             FP32 and Tensor Core kernels, dispatch, timing
+app/benchmark.cpp            repeatable benchmark CLI and CSV export
+tests/correctness.cpp        shape, precision, and validation regressions
+scripts/plot_results.py      figure generation from committed measurements
+docs/optimization-notes.md   design rationale and rejected prototypes
+results/                     raw reference measurements
+~~~
+
+## Engineering decisions
+
+The final implementation keeps only mechanisms supported by correctness tests
+and measured behavior. In-kernel FP16 casting was replaced with true 16-bit
+storage and WMMA execution. Precision-changing kernels remain opt-in. Fixed
+stream slicing and oversized channel-parallel reductions were not retained;
+their failure modes and the conditions required for better designs are recorded
+in [the optimization notes](docs/optimization-notes.md).
+
 ## Scope
 
-This is an educational kernel study, not a replacement for cuDNN. It currently
-implements unpadded, undilated FP32, FP16, and BF16 cross-correlation with
-square kernels. Tensor Core outputs accumulate in FP32.
-Performance claims are limited to the committed shapes, hardware, and raw
-results. See [the optimization notes](docs/optimization-notes.md) for the
-rationale and the experiments that did not survive validation.
+The current API implements valid, unpadded, undilated NCHW cross-correlation
+with square kernels in FP32, FP16, and BF16. It is a ground-up kernel engineering
+project, not a claim to outperform cuDNN; production libraries add autotuning,
+architecture-specific engines, fusion, and broader operator coverage. All
+performance claims here are limited to the committed hardware, shapes, code,
+and raw measurements.
 
-Nsight Compute source-level profiling is supported by the build, but hardware
-performance counters were unavailable on the reference Windows configuration.
-No peak-occupancy or peak-bandwidth claim is made without those counters.
-
-## Authorship and license
+## Author and license
 
 Designed and implemented by **Nippun Sabharwal**. Released under the MIT
 License.
