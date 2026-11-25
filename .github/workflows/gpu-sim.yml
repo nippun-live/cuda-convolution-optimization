@@ -1,0 +1,69 @@
+name: gpu-sim
+
+# Optional check. The hosted runners have no GPU, so this builds the project
+# and runs the cuda-conv-correctness ctest on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements runs on real GPUs.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    name: cuda-conv-correctness (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The simulator runs PTX only and needs a shared CUDA runtime, so the
+      # architecture is overridden to 90-virtual and the runtime set to Shared.
+      - name: Configure and build
+        run: |
+          vgpu run --preload cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+          vgpu run --preload cmake --build build -j3 --target cuda-conv-correctness
+
+      # The test compares every CUDA algorithm (direct, tiled GEMM, FP16 and
+      # BF16 tensor core, adaptive) with the CPU reference and exits non-zero
+      # on a mismatch. The guard also fails the job on a simulator error, a
+      # skipped test, or missing or failing result rows.
+      - name: Run cuda-conv-correctness on the simulated GPU
+        run: |
+          set -o pipefail
+          vgpu run --counters ./build/cuda-conv-correctness 2>&1 | tee test.log
+          if grep -Eiq 'VirtualGPU error|no (usable )?(cuda )?device|skipped|^error:' test.log; then
+            echo "::error::GPU error, missing device or skipped test in the output"; exit 1
+          fi
+          if grep -Eq ' FAIL$' test.log; then echo "::error::failing rows"; exit 1; fi
+          n=$(grep -Ec ' PASS$' test.log)
+          echo "$n PASS rows"
+          [ "$n" -ge 22 ] || { echo "::error::too few result rows"; exit 1; }
+          # --counters prints one line per simulated kernel launch.
+          for k in direct_kernel tiled_gemm_kernel 'tensor_core_kernelI6__half' 'tensor_core_kernelI13__nv_bfloat16'; do
+            grep -F '[vgpu][counters]' test.log | grep -Fq "$k" || { echo "::error::no launch of $k"; exit 1; }
+          done
+          grep -Eq '^invalid shape validation PASS$' test.log || { echo "::error::invalid-shape row missing"; exit 1; }
